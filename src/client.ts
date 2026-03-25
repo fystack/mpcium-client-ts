@@ -5,6 +5,7 @@ import {
   AckPolicy,
   NatsError,
   ConsumerMessages,
+  headers,
 } from "nats";
 import { v4 as uuidv4 } from "uuid";
 import {
@@ -29,15 +30,44 @@ const jc = JSONCodec();
 
 // NATS topics
 const SUBJECTS = {
-  KEYGEN_RESULT: "mpc.mpc_keygen_result.*",
-  SIGNING_RESULT: "mpc.mpc_signing_result.*",
-  RESHARE_RESULT: "mpc.mpc_reshare_result.*",
+  KEYGEN_RESULT_LEGACY: "mpc.mpc_keygen_result.*",
+  SIGNING_RESULT_LEGACY: "mpc.mpc_signing_result.complete",
+  RESHARE_RESULT_LEGACY: "mpc.mpc_reshare_result.*",
   RESHARE_REQUEST: "mpc:reshare",
 };
+
+const CONSUMER_NAMES = {
+  KEYGEN_RESULT: "mpc_keygen_result",
+  SIGNING_RESULT: "mpc_signing_result",
+  RESHARE_RESULT: "mpc_reshare_result",
+};
+
+function validateClientID(clientID?: string): string | undefined {
+  if (clientID === undefined) {
+    return undefined;
+  }
+
+  if (clientID === "") {
+    return "";
+  }
+
+  if (clientID.trim().length === 0) {
+    throw new Error("Invalid clientID: blank-only values are not allowed");
+  }
+
+  if (/[ \t\r\n.*>]/.test(clientID)) {
+    throw new Error(
+      'Invalid clientID: disallowed characters are space, tab, ".", "*", ">"'
+    );
+  }
+
+  return clientID;
+}
 
 export class MpciumClient {
   private privateKey: Buffer;
   private subscriptions: (Subscription | ConsumerMessages)[] = [];
+  private readonly clientID?: string;
 
   /**
    * Create a new MpciumClient instance
@@ -70,6 +100,7 @@ export class MpciumClient {
    * Private constructor - use static create() method instead
    */
   private constructor(private options: MpciumOptions, privateKey: Buffer) {
+    this.clientID = validateClientID(options.clientID);
     this.privateKey = privateKey;
 
     // Set up status monitoring for the NATS connection
@@ -198,6 +229,63 @@ export class MpciumClient {
     }
   }
 
+  private getScopedClientID(): string | undefined {
+    if (!this.clientID) {
+      return undefined;
+    }
+    return this.clientID;
+  }
+
+  private getResultSubjects(): {
+    keygen: string;
+    signing: string;
+    reshare: string;
+  } {
+    const scopedClientID = this.getScopedClientID();
+    if (!scopedClientID) {
+      return {
+        keygen: SUBJECTS.KEYGEN_RESULT_LEGACY,
+        signing: SUBJECTS.SIGNING_RESULT_LEGACY,
+        reshare: SUBJECTS.RESHARE_RESULT_LEGACY,
+      };
+    }
+
+    return {
+      keygen: `mpc.mpc_keygen_result.${scopedClientID}.*`,
+      signing: `mpc.mpc_signing_result.${scopedClientID}.complete`,
+      reshare: `mpc.mpc_reshare_result.${scopedClientID}.*`,
+    };
+  }
+  
+  private getConsumerName(baseName: string): string {
+    const scopedClientID = this.getScopedClientID();
+    if (!scopedClientID) {
+      return baseName;
+    }
+  
+    let consumerName = `${baseName}.${scopedClientID}`
+      .replace(/[.\s:\-]/g, "_")
+      .replace(/>/g, "all")
+      .replace(/\*/g, "any");
+  
+    if (consumerName.length > 0 && !/^[A-Za-z_]/.test(consumerName)) {
+      consumerName = `_${consumerName}`;
+    }
+  
+    return consumerName;
+  }
+
+  private getPublishHeaders(): ReturnType<typeof headers> | undefined {
+    const scopedClientID = this.getScopedClientID();
+    if (!scopedClientID) {
+      return undefined;
+    }
+
+    const hdrs = headers();
+    hdrs.set("ClientID", scopedClientID);
+    return hdrs;
+  }
+
   /**
    * Create a new MPC wallet
    * @param walletId Optional wallet ID (generates UUID if not provided)
@@ -205,6 +293,7 @@ export class MpciumClient {
    */
   async createWallet(walletId?: string): Promise<string> {
     const { nc } = this.options;
+    const publishHeaders = this.getPublishHeaders();
 
     // Generate a wallet ID if not provided
     const id = walletId || uuidv4();
@@ -222,12 +311,16 @@ export class MpciumClient {
       // Try JetStream first
       await this.ensureStreamsExist();
       const js = nc.jetstream();
-      await js.publish(`mpc.keygen_request.${walletId}`, jc.encode(msg));
+      await js.publish(`mpc.keygen_request.${id}`, jc.encode(msg), {
+        headers: publishHeaders,
+      });
       console.log(`CreateWallet request sent via JetStream for wallet: ${id}`);
     } catch (err) {
       // Fall back to core NATS if JetStream is not available
       console.warn("JetStream not available, falling back to core NATS", err);
-      nc.publish("mpc.keygen_request", jc.encode(msg));
+      nc.publish("mpc.keygen_request", jc.encode(msg), {
+        headers: publishHeaders,
+      });
       console.log(`CreateWallet request sent via core NATS for wallet: ${id}`);
     }
 
@@ -246,6 +339,7 @@ export class MpciumClient {
     tx: string;
   }): Promise<string> {
     const { nc } = this.options;
+    const publishHeaders = this.getPublishHeaders();
 
     const txId = uuidv4();
 
@@ -266,14 +360,18 @@ export class MpciumClient {
       // Try JetStream first
       await this.ensureStreamsExist();
       const js = nc.jetstream();
-      await js.publish(`mpc.signing_request.${txId}`, jc.encode(msg));
+      await js.publish(`mpc.signing_request.${txId}`, jc.encode(msg), {
+        headers: publishHeaders,
+      });
       console.log(
         `SignTransaction request sent via JetStream for txID: ${txId}`
       );
     } catch (err) {
       // Fall back to core NATS if JetStream is not available
       console.warn("JetStream not available, falling back to core NATS");
-      nc.publish(`mpc.signing_request.${txId}`, jc.encode(msg));
+      nc.publish(`mpc.signing_request.${txId}`, jc.encode(msg), {
+        headers: publishHeaders,
+      });
       console.log(
         `SignTransaction request sent via core NATS for txID: ${txId}`
       );
@@ -295,6 +393,7 @@ export class MpciumClient {
     keyType: KeyType;
   }): Promise<string> {
     const { nc } = this.options;
+    const publishHeaders = this.getPublishHeaders();
 
     // Generate session ID if not provided
     const sessionId = params.sessionId || uuidv4();
@@ -315,7 +414,9 @@ export class MpciumClient {
     msg.signature = signatureBuffer.toString("base64");
 
     // Use core NATS to publish (matching Go implementation)
-    nc.publish(SUBJECTS.RESHARE_REQUEST, jc.encode(msg));
+    nc.publish(SUBJECTS.RESHARE_REQUEST, jc.encode(msg), {
+      headers: publishHeaders,
+    });
     console.log(`Resharing request sent for session: ${sessionId}`);
 
     return sessionId;
@@ -323,7 +424,8 @@ export class MpciumClient {
 
   onWalletCreationResult(callback: (event: KeygenResultEvent) => void): void {
     const { nc } = this.options;
-    const consumerName = `mpc_keygen_result`;
+    const resultSubjects = this.getResultSubjects();
+    const consumerName = this.getConsumerName(CONSUMER_NAMES.KEYGEN_RESULT);
 
     (async () => {
       const js = nc.jetstream(); // for pub/sub
@@ -337,7 +439,7 @@ export class MpciumClient {
         try {
           await jsm.streams.add({
             name: "mpc",
-            subjects: [SUBJECTS.KEYGEN_RESULT],
+            subjects: [resultSubjects.keygen],
             retention: RetentionPolicy.Interest,
             max_bytes: 100 * 1024 * 1024,
           });
@@ -362,7 +464,7 @@ export class MpciumClient {
         await jsm.consumers.add("mpc", {
           durable_name: consumerName,
           ack_policy: AckPolicy.Explicit,
-          filter_subject: SUBJECTS.KEYGEN_RESULT,
+          filter_subject: resultSubjects.keygen,
           max_deliver: 3,
         });
       }
@@ -394,7 +496,8 @@ export class MpciumClient {
 
   onSignResult(callback: (event: SigningResultEvent) => void): void {
     const { nc } = this.options;
-    const consumerName = `mpc_signing_result`;
+    const resultSubjects = this.getResultSubjects();
+    const consumerName = this.getConsumerName(CONSUMER_NAMES.SIGNING_RESULT);
 
     (async () => {
       const js = nc.jetstream(); // for pub/sub
@@ -408,7 +511,7 @@ export class MpciumClient {
         try {
           await jsm.streams.add({
             name: "mpc",
-            subjects: [SUBJECTS.SIGNING_RESULT],
+            subjects: [resultSubjects.signing],
             retention: RetentionPolicy.Interest,
             max_bytes: 100 * 1024 * 1024,
           });
@@ -433,7 +536,7 @@ export class MpciumClient {
         await jsm.consumers.add("mpc", {
           durable_name: consumerName,
           ack_policy: AckPolicy.Explicit,
-          filter_subject: SUBJECTS.SIGNING_RESULT,
+          filter_subject: resultSubjects.signing,
           max_deliver: 3,
         });
       }
@@ -466,7 +569,8 @@ export class MpciumClient {
    */
   onResharingResult(callback: (event: ResharingResultEvent) => void): void {
     const { nc } = this.options;
-    const consumerName = `mpc_reshare_result`;
+    const resultSubjects = this.getResultSubjects();
+    const consumerName = this.getConsumerName(CONSUMER_NAMES.RESHARE_RESULT);
 
     (async () => {
       const js = nc.jetstream(); // for pub/sub
@@ -478,7 +582,7 @@ export class MpciumClient {
         try {
           await jsm.streams.add({
             name: "mpc",
-            subjects: [SUBJECTS.RESHARE_RESULT],
+            subjects: [resultSubjects.reshare],
             retention: RetentionPolicy.Workqueue,
             max_bytes: 100 * 1024 * 1024,
           });
@@ -500,7 +604,7 @@ export class MpciumClient {
         await jsm.consumers.add("mpc", {
           durable_name: consumerName,
           ack_policy: AckPolicy.Explicit,
-          filter_subject: SUBJECTS.RESHARE_RESULT,
+          filter_subject: resultSubjects.reshare,
           max_deliver: 3,
         });
       }

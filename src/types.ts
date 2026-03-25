@@ -10,6 +10,7 @@ export interface MpciumOptions {
   keyPath: string;
   password?: string; // Optional password for encrypted keys
   encrypted?: boolean; // Explicitly specify if key is encrypted
+  clientID?: string;
 }
 
 export interface GenerateKeyMessage {
