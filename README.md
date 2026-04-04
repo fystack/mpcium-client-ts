@@ -209,6 +209,77 @@ async function signSolanaTransaction(walletId) {
 
 [Full example: sign-solana.ts](./examples/sign-solana.ts)
 
+### HD Wallet Derivation (`derivation_path`)
+
+Instead of running DKG for every user, you can generate **one master wallet** and derive unlimited child addresses using BIP-32 non-hardened child key derivation (CKD). The `derivation_path` is passed at signing time — the MPC nodes derive the same child key server-side during the signing ceremony.
+
+**Architecture:**
+- One DKG (`createWallet`) produces a master public key + chain code
+- Child addresses are derived client-side via `deriveEthereumAddress()` / `deriveSecp256k1ChildCompressed()` / `deriveEd25519ChildCompressed()`
+- At signing time, pass `derivationPath` so MPC nodes sign with the matching child key
+- A single backup at init time is enough to restore all wallets
+
+```ts
+import { connect } from "nats";
+import {
+  MpciumClient,
+  KeyType,
+  deriveEthereumAddress,
+  compressPublicKey,
+} from "@fystack/mpcium-ts";
+import fs from "fs";
+
+async function signWithDerivedKey(walletId: string, userIndex: number) {
+  const nc = await connect({ servers: "nats://localhost:4222" });
+  const mpcClient = await MpciumClient.create({
+    nc,
+    keyPath: "./event_initiator.key",
+  });
+
+  // Load wallet generated via createWallet() — must include
+  // ecdsa_pub_key and chain_code from the DKG result
+  const wallets = JSON.parse(fs.readFileSync("./wallets.json", "utf8"));
+  const wallet = wallets[walletId];
+
+  // Compress the master public key (DKG may return 64/65-byte uncompressed)
+  const masterPubKey = new Uint8Array(
+    Buffer.from(wallet.ecdsa_pub_key, "base64")
+  );
+  const compressed =
+    masterPubKey.length === 33
+      ? masterPubKey
+      : compressPublicKey(masterPubKey);
+
+  // Derive child address locally — same result the MPC nodes will compute
+  const derivationPath = [44, 60, 0, 0, userIndex];
+  const childAddress = deriveEthereumAddress(
+    compressed,
+    wallet.chain_code, // hex string from DKG result
+    derivationPath
+  );
+
+  console.log(`User #${userIndex} address: ${childAddress}`);
+
+  // Build your transaction using childAddress as the sender,
+  // then base64-encode the tx hash for signing:
+  const txHash = "..."; // unsigned transaction hash (hex, no 0x prefix)
+  const txPayload = Buffer.from(txHash, "hex").toString("base64");
+
+  // Sign with derivation_path — MPC nodes derive the same child key
+  const txId = await mpcClient.signTransaction({
+    walletId: walletId,
+    keyType: KeyType.Secp256k1,
+    networkInternalCode: "ethereum:sepolia",
+    tx: txPayload,
+    derivationPath: derivationPath, // ← enables HD child signing
+  });
+}
+```
+
+The same approach works for Ed25519 chains (Solana, Polkadot) using `deriveEd25519ChildCompressed()`.
+
+[Full example: sign-eth-derived.ts](./examples/sign-eth-derived.ts)
+
 ### Signing a Polkadot Transaction (Native Token Transfer)
 
 ```ts

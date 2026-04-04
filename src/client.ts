@@ -337,6 +337,7 @@ export class MpciumClient {
     keyType: KeyType;
     networkInternalCode: string;
     tx: string;
+    derivationPath?: number[];
   }): Promise<string> {
     const { nc } = this.options;
     const publishHeaders = this.getPublishHeaders();
@@ -350,6 +351,7 @@ export class MpciumClient {
       network_internal_code: params.networkInternalCode,
       tx_id: txId,
       tx: params.tx,
+      derivation_path: params.derivationPath,
     };
 
     // Sign the message and convert Buffer to base64 string

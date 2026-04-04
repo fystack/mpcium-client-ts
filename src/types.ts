@@ -25,6 +25,7 @@ export interface SignTxMessage {
   tx_id: string;
   tx: string;
   signature?: string;
+  derivation_path?: number[];
 }
 
 export interface KeygenResultEvent {

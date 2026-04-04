@@ -21,6 +21,8 @@ export {
   signResharingMessage,
 } from "./utils";
 
+export * from "./ckdutil";
+
 // Export Polkadot/Substrate utilities
 export {
   buildSigningPayload,
